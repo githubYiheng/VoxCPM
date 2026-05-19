@@ -6,3 +6,5 @@ voxcpm.egg-info
 # Local files
 models/
 voxcpm-env/
+./pretrained_models/
+app_local.py
