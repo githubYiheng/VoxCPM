@@ -10,7 +10,7 @@ Usage:
 Environment Variables:
     API_HOST                  - Server host (default: 0.0.0.0)
     API_PORT                  - Server port (default: 8000)
-    HF_MODEL_ID               - HuggingFace model ID (default: openbmb/VoxCPM1.5)
+    HF_MODEL_ID               - HuggingFace model ID (default: openbmb/VoxCPM2)
     MODEL_PATH                - Local model path (overrides HF_MODEL_ID)
     LOAD_DENOISER             - Load denoiser model (default: true)
     MAX_CONCURRENT_REQUESTS   - Max concurrent inference requests (default: 1)
@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, alias="API_PORT")
 
     # Model
-    hf_model_id: str = Field(default="openbmb/VoxCPM1.5", alias="HF_MODEL_ID")
+    hf_model_id: str = Field(default="openbmb/VoxCPM2", alias="HF_MODEL_ID")
     model_path: Optional[str] = Field(default=None, alias="MODEL_PATH")
     cache_dir: Optional[str] = Field(default=None, alias="CACHE_DIR")
     local_files_only: bool = Field(default=False, alias="LOCAL_FILES_ONLY")

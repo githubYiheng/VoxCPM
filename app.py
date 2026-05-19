@@ -375,7 +375,7 @@ def create_demo_interface(demo: VoxCPMDemo):
             logger.warning(f"ASR recognition failed: {e}")
             return gr.update(value="")
 
-    with gr.Blocks() as interface:
+    with gr.Blocks(theme=_APP_THEME, css=_CUSTOM_CSS) as interface:
         gr.HTML(
             '<div class="logo-container">'
             '<img src="/gradio_api/file=assets/voxcpm_logo.png" alt="VoxCPM Logo">'
@@ -495,8 +495,6 @@ def run_demo(
         server_port=server_port,
         show_error=show_error,
         i18n=I18N,
-        theme=_APP_THEME,
-        css=_CUSTOM_CSS,
     )
 
 
