@@ -25,10 +25,12 @@ import io
 import os
 import tempfile
 import threading
+import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import numpy as np
 import soundfile as sf
@@ -50,6 +52,7 @@ from pydantic_settings import BaseSettings
 
 import voxcpm
 from voxcpm.model.voxcpm import LoRAConfig
+from voxcpm.model.voxcpm2 import VoxCPM2Model
 
 
 # =============================================================================
@@ -112,7 +115,7 @@ class TTSRequest(BaseModel):
 
     text: str = Field(..., min_length=1, max_length=10000, description="Text to synthesize")
     cfg_value: float = Field(default=2.0, ge=1.0, le=5.0, description="CFG guidance value")
-    inference_timesteps: int = Field(default=10, ge=4, le=50, description="Inference steps")
+    inference_timesteps: int = Field(default=5, ge=4, le=50, description="Inference steps")
     min_len: int = Field(default=2, ge=1, description="Minimum output length")
     max_len: int = Field(default=4096, ge=10, le=8192, description="Maximum output length")
     normalize: bool = Field(default=False, description="Enable text normalization")
@@ -309,6 +312,109 @@ temp_manager = TempFileManager()
 
 
 # =============================================================================
+# Prompt Cache Managers (singleton, thread-safe LRU)
+# =============================================================================
+
+class ReferenceManager:
+    """LRU cache of long-lived reference prompt_cache dicts keyed by reference_id."""
+
+    _instance: Optional["ReferenceManager"] = None
+    _instance_lock = threading.Lock()
+    MAX_SIZE = 32
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    inst = super().__new__(cls)
+                    inst._lock = threading.Lock()
+                    inst._cache = OrderedDict()
+                    inst._meta = {}
+                    cls._instance = inst
+        return cls._instance
+
+    def add(self, reference_id: str, prompt_cache: dict, meta: dict) -> None:
+        with self._lock:
+            self._cache[reference_id] = prompt_cache
+            self._meta[reference_id] = meta
+            self._cache.move_to_end(reference_id)
+            while len(self._cache) > self.MAX_SIZE:
+                oldest, _ = self._cache.popitem(last=False)
+                self._meta.pop(oldest, None)
+
+    def get(self, reference_id: str):
+        with self._lock:
+            if reference_id not in self._cache:
+                return None, None
+            self._cache.move_to_end(reference_id)
+            return self._cache[reference_id], dict(self._meta[reference_id])
+
+    def delete(self, reference_id: str) -> bool:
+        with self._lock:
+            if reference_id not in self._cache:
+                return False
+            del self._cache[reference_id]
+            self._meta.pop(reference_id, None)
+            return True
+
+    def list(self) -> list:
+        with self._lock:
+            return [
+                {"reference_id": rid, **self._meta[rid]}
+                for rid in reversed(self._cache)
+            ]
+
+
+class ChainManager:
+    """LRU + TTL cache of merged prompt_cache states for chain TTS, keyed by chunk_id."""
+
+    _instance: Optional["ChainManager"] = None
+    _instance_lock = threading.Lock()
+    MAX_SIZE = 200
+    TTL_SECONDS = 1800  # 30 minutes
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    inst = super().__new__(cls)
+                    inst._lock = threading.Lock()
+                    inst._cache: OrderedDict[str, tuple] = OrderedDict()
+                    cls._instance = inst
+        return cls._instance
+
+    def _evict_locked(self) -> None:
+        now = time.time()
+        expired = [k for k, (_, exp) in self._cache.items() if exp < now]
+        for k in expired:
+            del self._cache[k]
+        while len(self._cache) > self.MAX_SIZE:
+            self._cache.popitem(last=False)
+
+    def add(self, chunk_id: str, merged_cache: dict) -> None:
+        with self._lock:
+            expires_at = time.time() + self.TTL_SECONDS
+            self._cache[chunk_id] = (merged_cache, expires_at)
+            self._cache.move_to_end(chunk_id)
+            self._evict_locked()
+
+    def get(self, chunk_id: str):
+        with self._lock:
+            if chunk_id not in self._cache:
+                return None
+            cache, expires_at = self._cache[chunk_id]
+            if expires_at < time.time():
+                del self._cache[chunk_id]
+                return None
+            self._cache.move_to_end(chunk_id)
+            return cache
+
+
+reference_manager = ReferenceManager()
+chain_manager = ChainManager()
+
+
+# =============================================================================
 # Inference Executor
 # =============================================================================
 
@@ -343,7 +449,7 @@ def generate_audio_sync(
     prompt_wav_path: Optional[str] = None,
     prompt_text: Optional[str] = None,
     cfg_value: float = 2.0,
-    inference_timesteps: int = 10,
+    inference_timesteps: int = 5,
     min_len: int = 2,
     max_len: int = 4096,
     normalize: bool = False,
@@ -375,6 +481,56 @@ def array_to_bytes(audio: np.ndarray, sample_rate: int, fmt: str = "wav") -> byt
     sf.write(buffer, audio, sample_rate, format=fmt)
     buffer.seek(0)
     return buffer.read()
+
+
+def build_prompt_cache_sync(
+    model: voxcpm.VoxCPM,
+    prompt_text: Optional[str],
+    prompt_wav_path: Optional[str],
+    reference_wav_path: Optional[str],
+) -> dict:
+    """Synchronously build a prompt_cache via the underlying tts_model."""
+    kwargs: dict = {}
+    if prompt_text is not None and prompt_wav_path is not None:
+        kwargs["prompt_text"] = prompt_text
+        kwargs["prompt_wav_path"] = prompt_wav_path
+    if reference_wav_path is not None:
+        if not isinstance(model.tts_model, VoxCPM2Model):
+            raise ValueError("reference_wav_path requires a VoxCPM2 model")
+        kwargs["reference_wav_path"] = reference_wav_path
+    if not kwargs:
+        raise ValueError("Must provide prompt_wav_path+prompt_text or reference_wav_path")
+    return model.tts_model.build_prompt_cache(**kwargs)
+
+
+def generate_with_cache_sync(
+    model: voxcpm.VoxCPM,
+    text: str,
+    prompt_cache: dict,
+    cfg_value: float,
+    inference_timesteps: int,
+    min_len: int,
+    max_len: int,
+    retry_badcase: bool,
+    retry_badcase_max_times: int,
+    retry_badcase_ratio_threshold: float,
+):
+    """Run generate_with_prompt_cache and return (audio_np, pred_audio_feat)."""
+    audio_tensor, _target_text_token, pred_audio_feat = (
+        model.tts_model.generate_with_prompt_cache(
+            target_text=text,
+            prompt_cache=prompt_cache,
+            cfg_value=cfg_value,
+            inference_timesteps=inference_timesteps,
+            min_len=min_len,
+            max_len=max_len,
+            retry_badcase=retry_badcase,
+            retry_badcase_max_times=retry_badcase_max_times,
+            retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+        )
+    )
+    audio_np = audio_tensor.detach().cpu().numpy().astype(np.float32).reshape(-1)
+    return audio_np, pred_audio_feat
 
 
 # =============================================================================
@@ -572,7 +728,7 @@ async def voice_clone(
     text: Annotated[str, Form(..., min_length=1, max_length=10000)],
     prompt_text: Annotated[str, Form(..., min_length=1, max_length=2000)],
     cfg_value: Annotated[float, Form(ge=1.0, le=5.0)] = 2.0,
-    inference_timesteps: Annotated[int, Form(ge=4, le=50)] = 10,
+    inference_timesteps: Annotated[int, Form(ge=4, le=50)] = 5,
     min_len: Annotated[int, Form(ge=1)] = 2,
     max_len: Annotated[int, Form(ge=10, le=8192)] = 4096,
     normalize: Annotated[bool, Form()] = False,
@@ -660,6 +816,240 @@ async def voice_clone(
     except Exception as e:
         temp_manager.safe_delete(temp_path)
         raise HTTPException(500, f"Generation failed: {e}")
+
+
+# =============================================================================
+# References & Chain Endpoints
+# =============================================================================
+
+
+class ReferenceCreateResponse(BaseModel):
+    reference_id: str
+    mode: str
+    transcript: Optional[str] = None
+    audio_filename: Optional[str] = None
+    created_at: float
+
+
+class ReferenceListItem(BaseModel):
+    reference_id: str
+    mode: str
+    transcript: Optional[str] = None
+    audio_filename: Optional[str] = None
+    created_at: float
+
+
+class ReferenceListResponse(BaseModel):
+    references: list[ReferenceListItem]
+
+
+@app.post("/references", response_model=ReferenceCreateResponse, tags=["References"])
+async def create_reference(
+    model: Annotated[voxcpm.VoxCPM, Depends(get_model)],
+    audio: UploadFile = File(..., description="Reference audio file"),
+    transcript: Annotated[Optional[str], Form(max_length=2000)] = None,
+):
+    """Register a reference audio (+ optional transcript) and pre-build its prompt cache.
+
+    - With ``transcript``: Ultimate Cloning (prompt_wav + reference_wav + prompt_text).
+    - Without ``transcript``: reference-only voice cloning (VoxCPM2 ``reference_wav_path``).
+
+    Returns a ``reference_id`` that subsequent /tts/clone_ref and /tts/chain calls reuse,
+    so the audio is VAE-encoded only once.
+    """
+    if audio.filename:
+        ext = os.path.splitext(audio.filename)[1].lower()
+        if ext not in settings.allowed_audio_extensions:
+            raise HTTPException(400, f"Unsupported format: {ext}")
+
+    content = await audio.read()
+    if len(content) > settings.max_upload_size_mb * 1024 * 1024:
+        raise HTTPException(400, f"File too large. Max: {settings.max_upload_size_mb}MB")
+
+    temp_path = temp_manager.create_temp_path()
+    with open(temp_path, "wb") as f:
+        f.write(content)
+
+    transcript_clean = transcript.strip() if transcript else None
+
+    try:
+        loop = asyncio.get_event_loop()
+        semaphore = get_inference_semaphore()
+        async with semaphore:
+            prompt_cache = await loop.run_in_executor(
+                _executor,
+                build_prompt_cache_sync,
+                model,
+                transcript_clean,
+                temp_path if transcript_clean else None,
+                temp_path,
+            )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to build prompt cache: {e}")
+    finally:
+        temp_manager.safe_delete(temp_path)
+
+    reference_id = f"ref_{uuid.uuid4().hex[:12]}"
+    meta = {
+        "mode": prompt_cache.get("mode", "unknown"),
+        "transcript": transcript_clean,
+        "audio_filename": audio.filename,
+        "created_at": time.time(),
+    }
+    reference_manager.add(reference_id, prompt_cache, meta)
+    return ReferenceCreateResponse(reference_id=reference_id, **meta)
+
+
+@app.get("/references", response_model=ReferenceListResponse, tags=["References"])
+async def list_references():
+    """List currently-cached references (most-recent first)."""
+    return ReferenceListResponse(references=reference_manager.list())
+
+
+@app.delete("/references/{reference_id}", tags=["References"])
+async def delete_reference(reference_id: str):
+    """Evict a reference from the cache."""
+    if not reference_manager.delete(reference_id):
+        raise HTTPException(404, f"reference_id not found: {reference_id}")
+    return {"deleted": reference_id}
+
+
+class TTSCloneRefRequest(TTSRequest):
+    """Voice clone using a pre-registered reference (no file upload)."""
+
+    reference_id: str = Field(..., description="reference_id from POST /references")
+
+
+@app.post("/tts/clone_ref", response_class=Response, tags=["TTS"])
+async def voice_clone_by_reference(
+    request: TTSCloneRefRequest,
+    model: Annotated[voxcpm.VoxCPM, Depends(get_model)],
+):
+    """Voice clone reusing a cached reference. Skips per-call audio encoding."""
+    prompt_cache, _meta = reference_manager.get(request.reference_id)
+    if prompt_cache is None:
+        raise HTTPException(404, f"reference_id not found: {request.reference_id}")
+
+    try:
+        loop = asyncio.get_event_loop()
+        semaphore = get_inference_semaphore()
+        async with semaphore:
+            audio_np, _ = await loop.run_in_executor(
+                _executor,
+                generate_with_cache_sync,
+                model,
+                request.text,
+                prompt_cache,
+                request.cfg_value,
+                request.inference_timesteps,
+                request.min_len,
+                request.max_len,
+                request.retry_badcase,
+                request.retry_badcase_max_times,
+                request.retry_badcase_ratio_threshold,
+            )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Generation failed: {e}")
+
+    sample_rate = model.tts_model.sample_rate
+    duration = len(audio_np) / sample_rate
+    audio_bytes = array_to_bytes(audio_np, sample_rate, request.output_format)
+    media_types = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac"}
+    return Response(
+        content=audio_bytes,
+        media_type=media_types.get(request.output_format, "audio/wav"),
+        headers={
+            "X-Sample-Rate": str(sample_rate),
+            "X-Duration-Seconds": f"{duration:.2f}",
+            "X-Text-Length": str(len(request.text)),
+            "X-Reference-Id": request.reference_id,
+            "Content-Disposition": f'attachment; filename="output.{request.output_format}"',
+        },
+    )
+
+
+class TTSChainRequest(TTSRequest):
+    """Chain TTS: synthesize next chunk continuing from a previous one with zero drift."""
+
+    reference_id: str = Field(..., description="Anchor reference_id from POST /references")
+    parent_chunk_id: Optional[str] = Field(
+        default=None,
+        description="X-Chunk-Id of the previous /tts/chain response. If omitted, "
+                    "starts a new chain from the reference.",
+    )
+
+
+@app.post("/tts/chain", response_class=Response, tags=["TTS"])
+async def voice_chain(
+    request: TTSChainRequest,
+    model: Annotated[voxcpm.VoxCPM, Depends(get_model)],
+):
+    """Generate the next chunk in a chain, using merge_prompt_cache so the prior
+    chunk's audio feature is in-memory concatenated (no wav round-trip)."""
+    if request.parent_chunk_id:
+        prompt_cache = chain_manager.get(request.parent_chunk_id)
+        if prompt_cache is None:
+            raise HTTPException(
+                404,
+                f"parent_chunk_id expired or not found: {request.parent_chunk_id}",
+            )
+        chain_started = False
+    else:
+        prompt_cache, _meta = reference_manager.get(request.reference_id)
+        if prompt_cache is None:
+            raise HTTPException(404, f"reference_id not found: {request.reference_id}")
+        chain_started = True
+
+    try:
+        loop = asyncio.get_event_loop()
+        semaphore = get_inference_semaphore()
+        async with semaphore:
+            audio_np, pred_audio_feat = await loop.run_in_executor(
+                _executor,
+                generate_with_cache_sync,
+                model,
+                request.text,
+                prompt_cache,
+                request.cfg_value,
+                request.inference_timesteps,
+                request.min_len,
+                request.max_len,
+                request.retry_badcase,
+                request.retry_badcase_max_times,
+                request.retry_badcase_ratio_threshold,
+            )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Chain generation failed: {e}")
+
+    merged_cache = model.tts_model.merge_prompt_cache(
+        prompt_cache, request.text, pred_audio_feat
+    )
+    new_chunk_id = f"chunk_{uuid.uuid4().hex[:12]}"
+    chain_manager.add(new_chunk_id, merged_cache)
+
+    sample_rate = model.tts_model.sample_rate
+    duration = len(audio_np) / sample_rate
+    audio_bytes = array_to_bytes(audio_np, sample_rate, request.output_format)
+    media_types = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac"}
+    return Response(
+        content=audio_bytes,
+        media_type=media_types.get(request.output_format, "audio/wav"),
+        headers={
+            "X-Sample-Rate": str(sample_rate),
+            "X-Duration-Seconds": f"{duration:.2f}",
+            "X-Text-Length": str(len(request.text)),
+            "X-Reference-Id": request.reference_id,
+            "X-Chunk-Id": new_chunk_id,
+            "X-Chain-Started": "true" if chain_started else "false",
+            "Content-Disposition": f'attachment; filename="output.{request.output_format}"',
+        },
+    )
 
 
 # =============================================================================
