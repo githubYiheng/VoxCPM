@@ -1,4 +1,6 @@
-# VoxCPM Mac 启动指南
+# VoxCPM2 Mac 启动指南
+
+当前版本：**VoxCPM 2.0.3**（模型 VoxCPM2，2B 参数，48kHz）
 
 ## 首次安装（已完成）
 
@@ -10,6 +12,15 @@ uv pip install -e .
 uv pip install torchcodec
 ```
 
+## 模型下载（已完成，从 ModelScope，国内更快）
+
+```bash
+source voxcpm-env/bin/activate
+python -c "from modelscope import snapshot_download; snapshot_download('OpenBMB/VoxCPM2', local_dir='models/VoxCPM2')"
+```
+
+模型落在 `models/VoxCPM2`（约 4.3GB）。`start.sh` 和 `api_server.py` 默认都用这个本地路径，不再走 HuggingFace。
+
 ## 日常启动
 
 ```bash
@@ -18,11 +29,13 @@ uv pip install torchcodec
 
 访问：**http://localhost:7860**
 
+> 注：v2 的 `app.py` 默认端口是 8808，`start.sh` 里已用 `--port 7860` 固定回原来的端口。
+
 ## 命令行使用（可选）
 
 ```bash
 source voxcpm-env/bin/activate
-DYLD_LIBRARY_PATH=/opt/homebrew/Cellar/ffmpeg/7.1.1_3/lib voxcpm --text "你好世界" --output out.wav
+DYLD_LIBRARY_PATH=/opt/homebrew/Cellar/ffmpeg/7.1.1_3/lib voxcpm --text "你好世界" --output out.wav --model-path models/VoxCPM2
 ```
 
 ## API 服务
@@ -78,6 +91,7 @@ rm -rf voxcpm-env models
 
 ## 注意事项
 
-- 需要 FFmpeg（已通过 Homebrew 安装）
-- 使用 Apple Metal (MPS) 加速，速度约 15 it/s
-- 首次运行会自动下载模型（约2-3GB）
+- 需要 FFmpeg（已通过 Homebrew 安装）；命令前的 `DYLD_LIBRARY_PATH` 指向 ffmpeg 库，brew 升级 ffmpeg 后版本号 `7.1.1_3` 需同步更新
+- 使用 Apple Metal (MPS) 加速；VoxCPM2 在 MPS 上自动用 float32（bf16 有数值漂移）
+- **实测 RTF ≈ 0.80（M4 Max）**，约比实时快 1.25 倍；扩散步速 ~8 it/s
+- 首次运行已下载模型（VoxCPM2 ~4.3GB，辅助 ASR/降噪模型在 `~/.cache/modelscope`）
