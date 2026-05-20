@@ -15,8 +15,12 @@ model is 2B params, 48 kHz output, ZH/EN + ~30 languages.
 |------|---------|
 | `api_server.py` (+ `API_DOC.md`, `requirements-api.txt`) | A FastAPI **REST API** server. Upstream has no REST API — only the Python lib, CLI, and a Gradio demo. |
 | `start.sh` (+ `MAC_STARTUP.md`) | **One-click Mac/Apple-Silicon (MPS) launcher** for the Gradio web UI, incl. the ffmpeg library-path workaround. |
+| `start_api.sh` | One-command launcher for the REST API (sets ffmpeg path + `MODEL_PATH`, runs `api_server.py`). |
+| `longform_ab.py` | Long-form multi-chunk client + A/B harness for the voice-anchor drift fix (locked params + anchor-strength sweep). |
 
-Everything else (`app.py`, `src/voxcpm/`, `scripts/`, `conf/`, `docs/`) is upstream.
+**Voice-anchor inference patch** — the *only* fork change to upstream model code: `src/voxcpm/model/voxcpm2.py` + `src/voxcpm/core.py` add an optional `voice_anchor_strength` / `voice_anchor_tail_size` that blends a stable reference anchor back into the DiT condition each step, mitigating long-form timbre/emotion drift (ref [OpenBMB/VoxCPM#302](https://github.com/OpenBMB/VoxCPM/issues/302)). **Off by default (`strength=0.0` == upstream behaviour);** plumbed through `api_server.py` (per-request params + `VOICE_ANCHOR_*` env vars).
+
+Everything else (`app.py`, `scripts/`, `conf/`, `docs/`, and the rest of `src/voxcpm/`) is upstream.
 
 ## Key files
 

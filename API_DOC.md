@@ -78,7 +78,9 @@ GET /info
   "device": "mps",
   "dtype": "float32",
   "lora_enabled": false,
-  "denoiser_available": true
+  "denoiser_available": true,
+  "voice_anchor_strength_default": 0.0,
+  "voice_anchor_tail_size_default": 4
 }
 ```
 
@@ -118,6 +120,8 @@ Content-Type: application/json
 | `retry_badcase_max_times` | int | ❌ | 3 | 最大重试次数 |
 | `retry_badcase_ratio_threshold` | float | ❌ | 6.0 | 异常检测阈值 |
 | `output_format` | string | ❌ | "wav" | 输出格式：wav / mp3 / flac |
+| `voice_anchor_strength` | float | ❌ | 0.0 | 长文本音色/情绪抗漂移锚点强度（0–1，0=关，0.15 常用）。详见 [voice anchor 一节](#长文本音色情绪一致性voice-anchor) |
+| `voice_anchor_tail_size` | int | ❌ | 4 | 取参考尾部多少帧求平均做锚点 |
 
 **响应**
 
@@ -154,6 +158,8 @@ Content-Type: multipart/form-data
 | `inference_timesteps` | int | ❌ | 5 | 推理步数 |
 | `normalize` | bool | ❌ | false | 文本正则化 |
 | `output_format` | string | ❌ | "wav" | 输出格式 |
+| `voice_anchor_strength` | float | ❌ | 0.0 | 抗漂移锚点强度（见 [voice anchor 一节](#长文本音色情绪一致性voice-anchor)） |
+| `voice_anchor_tail_size` | int | ❌ | 4 | 参考尾部取帧数 |
 
 **响应**
 
@@ -250,7 +256,7 @@ Content-Type: application/json
 |------|------|------|--------|------|
 | `reference_id` | string | ✅ | - | 来自 `POST /references` |
 | `text` | string | ✅ | - | 要合成的文本(1-10000) |
-| 其它参数 | — | ❌ | — | 与 `/tts` 相同(`cfg_value` / `inference_timesteps` / `min_len` / `max_len` / `normalize` / `retry_badcase*` / `output_format`) |
+| 其它参数 | — | ❌ | — | 与 `/tts` 相同(`cfg_value` / `inference_timesteps` / `min_len` / `max_len` / `normalize` / `retry_badcase*` / `output_format` / `voice_anchor_strength` / `voice_anchor_tail_size`) |
 
 **响应**
 
@@ -305,6 +311,35 @@ Content-Type: application/json
 - chunk 缓存 LRU 上限 200 条
 - 单条 **TTL 30 分钟**,过期不能再被引用
 - 服务端重启,所有 chunk 链丢失;客户端需要重建
+
+---
+
+## 长文本音色/情绪一致性:voice anchor
+
+> 本 fork 新增,针对多段长文本合成的**音色/情绪漂移**问题(参考 [OpenBMB/VoxCPM#302](https://github.com/OpenBMB/VoxCPM/issues/302))。
+
+**问题**:VoxCPM2 生成时,解码条件每一步都被替换成"模型自己上一步生成的特征"(`prefix_feat_cond = pred_feat`),参考音色的锚点被逐步冲淡——单段越往后越漂,多段独立生成则各漂各的,拼接后音色/情绪有细微差异。
+
+**做法**:开启后,每一步都把从参考音频提取的稳定锚点(尾部若干帧的均值)**按比例混回**解码条件,持续把音色拉回参考。`voice_anchor_strength=0` 时行为与上游完全一致。
+
+**参数**(`/tts`、`/tts/clone`、`/tts/clone_ref`、`/tts/chain` 都支持):
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `voice_anchor_strength` | 0.0 | 锚点混合强度 0–1。**0=关(同上游)**;0.15 常用;还漂→0.25;发闷→0.10 |
+| `voice_anchor_tail_size` | 4 | 取参考尾部多少帧求平均做锚点 |
+
+也可用环境变量 `VOICE_ANCHOR_STRENGTH` / `VOICE_ANCHOR_TAIL_SIZE` 设全局默认,单次请求覆盖。
+
+**示例**:
+```bash
+curl -X POST http://localhost:8000/tts/clone_ref \
+  -H "Content-Type: application/json" \
+  -d '{"reference_id":"ref_xxx","text":"...","voice_anchor_strength":0.15}' \
+  --output out.wav
+```
+
+**最佳实践**:配合分段流程——每段复用同一 `reference_id`,所有段 `cfg_value` / `inference_timesteps` / `normalize` 完全一致,再叠加 `voice_anchor_strength=0.15`。强度需按音频耳测微调(过高会发闷)。仓库内 `longform_ab.py` 可一键扫不同强度并产出对比音频。
 
 ---
 
@@ -730,6 +765,8 @@ else:
 | `MAX_CONCURRENT_REQUESTS` | 1 | 最大并发请求数 |
 | `REQUEST_TIMEOUT_SECONDS` | 300 | 请求超时时间（秒） |
 | `MAX_UPLOAD_SIZE_MB` | 50 | 最大上传文件大小（MB） |
+| `VOICE_ANCHOR_STRENGTH` | 0.0 | voice anchor 全局默认强度（0=关，0.15 常用），单次请求可覆盖 |
+| `VOICE_ANCHOR_TAIL_SIZE` | 4 | 取参考音频尾部多少帧求平均做锚点 |
 
 ---
 

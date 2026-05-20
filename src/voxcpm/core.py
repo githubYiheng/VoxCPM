@@ -192,6 +192,8 @@ class VoxCPM:
         retry_badcase: bool = True,
         retry_badcase_max_times: int = 3,
         retry_badcase_ratio_threshold: float = 6.0,
+        voice_anchor_strength: float = 0.0,
+        voice_anchor_tail_size: int = 4,
         streaming: bool = False,
     ) -> Generator[np.ndarray, None, None]:
         """Synthesize speech for the given text and return a single waveform.
@@ -214,6 +216,12 @@ class VoxCPM:
             retry_badcase: Whether to retry badcase.
             retry_badcase_max_times: Maximum number of times to retry badcase.
             retry_badcase_ratio_threshold: Threshold for audio-to-text ratio.
+            voice_anchor_strength: Blend factor (0..1) that pins the decoder
+                condition back to a stable reference voice anchor every step,
+                mitigating long-form timbre/emotion drift (ref OpenBMB/VoxCPM#302).
+                0.0 disables it (upstream behaviour); 0.15 is a typical value.
+            voice_anchor_tail_size: Number of trailing reference/prompt audio
+                frames averaged to form the anchor.
             streaming: Whether to return a generator of audio chunks.
         Returns:
             Generator of numpy.ndarray: 1D waveform array (float32) on CPU.
@@ -290,6 +298,8 @@ class VoxCPM:
                 retry_badcase=retry_badcase,
                 retry_badcase_max_times=retry_badcase_max_times,
                 retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+                voice_anchor_strength=voice_anchor_strength,
+                voice_anchor_tail_size=voice_anchor_tail_size,
                 streaming=streaming,
             )
 

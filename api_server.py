@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     )
     optimize: bool = Field(default=True, alias="OPTIMIZE_MODEL")
 
+    # Voice anchor: mitigate long-form timbre/emotion drift (ref OpenBMB/VoxCPM#302)
+    voice_anchor_strength: float = Field(default=0.0, alias="VOICE_ANCHOR_STRENGTH")
+    voice_anchor_tail_size: int = Field(default=4, alias="VOICE_ANCHOR_TAIL_SIZE")
+
     # LoRA
     lora_weights_path: Optional[str] = Field(default=None, alias="LORA_WEIGHTS_PATH")
     lora_enable_lm: bool = Field(default=True, alias="LORA_ENABLE_LM")
@@ -124,6 +128,21 @@ class TTSRequest(BaseModel):
     retry_badcase_max_times: int = Field(default=3, ge=1, le=10, description="Max retry times")
     retry_badcase_ratio_threshold: float = Field(default=6.0, ge=1.0, le=20.0)
     output_format: Literal["wav", "mp3", "flac"] = Field(default="wav")
+    voice_anchor_strength: float = Field(
+        default_factory=lambda: settings.voice_anchor_strength,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Pin the decoder condition to a stable reference voice anchor every "
+            "step to reduce long-form timbre/emotion drift. 0 = off, 0.15 typical."
+        ),
+    )
+    voice_anchor_tail_size: int = Field(
+        default_factory=lambda: settings.voice_anchor_tail_size,
+        ge=1,
+        le=64,
+        description="Trailing reference/prompt audio frames averaged into the anchor.",
+    )
 
     @field_validator("text")
     @classmethod
@@ -166,6 +185,8 @@ class ModelInfoResponse(BaseModel):
     dtype: str
     lora_enabled: bool
     denoiser_available: bool
+    voice_anchor_strength_default: float
+    voice_anchor_tail_size_default: int
 
 
 class ErrorResponse(BaseModel):
@@ -457,6 +478,8 @@ def generate_audio_sync(
     retry_badcase: bool = True,
     retry_badcase_max_times: int = 3,
     retry_badcase_ratio_threshold: float = 6.0,
+    voice_anchor_strength: float = 0.0,
+    voice_anchor_tail_size: int = 4,
 ) -> np.ndarray:
     """Synchronous audio generation."""
     return model.generate(
@@ -472,6 +495,8 @@ def generate_audio_sync(
         retry_badcase=retry_badcase,
         retry_badcase_max_times=retry_badcase_max_times,
         retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+        voice_anchor_strength=voice_anchor_strength,
+        voice_anchor_tail_size=voice_anchor_tail_size,
     )
 
 
@@ -514,6 +539,8 @@ def generate_with_cache_sync(
     retry_badcase: bool,
     retry_badcase_max_times: int,
     retry_badcase_ratio_threshold: float,
+    voice_anchor_strength: float = 0.0,
+    voice_anchor_tail_size: int = 4,
 ):
     """Run generate_with_prompt_cache and return (audio_np, pred_audio_feat)."""
     audio_tensor, _target_text_token, pred_audio_feat = (
@@ -527,6 +554,8 @@ def generate_with_cache_sync(
             retry_badcase=retry_badcase,
             retry_badcase_max_times=retry_badcase_max_times,
             retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+            voice_anchor_strength=voice_anchor_strength,
+            voice_anchor_tail_size=voice_anchor_tail_size,
         )
     )
     audio_np = audio_tensor.detach().cpu().numpy().astype(np.float32).reshape(-1)
@@ -661,6 +690,8 @@ async def model_info(model: Annotated[voxcpm.VoxCPM, Depends(get_model)]):
         dtype=model.tts_model.config.dtype,
         lora_enabled=model.lora_enabled,
         denoiser_available=model.denoiser is not None,
+        voice_anchor_strength_default=settings.voice_anchor_strength,
+        voice_anchor_tail_size_default=settings.voice_anchor_tail_size,
     )
 
 
@@ -695,6 +726,8 @@ async def text_to_speech(
                 request.retry_badcase,
                 request.retry_badcase_max_times,
                 request.retry_badcase_ratio_threshold,
+                request.voice_anchor_strength,
+                request.voice_anchor_tail_size,
             )
 
         sample_rate = model.tts_model.sample_rate
@@ -736,6 +769,8 @@ async def voice_clone(
     retry_badcase: Annotated[bool, Form()] = True,
     retry_badcase_max_times: Annotated[int, Form(ge=1, le=10)] = 3,
     retry_badcase_ratio_threshold: Annotated[float, Form(ge=1.0, le=20.0)] = 6.0,
+    voice_anchor_strength: Annotated[float, Form(ge=0.0, le=1.0)] = settings.voice_anchor_strength,
+    voice_anchor_tail_size: Annotated[int, Form(ge=1, le=64)] = settings.voice_anchor_tail_size,
     output_format: Annotated[str, Form()] = "wav",
     # File upload
     prompt_audio: UploadFile = File(..., description="Reference audio file"),
@@ -785,6 +820,8 @@ async def voice_clone(
                 retry_badcase,
                 retry_badcase_max_times,
                 retry_badcase_ratio_threshold,
+                voice_anchor_strength,
+                voice_anchor_tail_size,
             )
 
         # Schedule temp file cleanup
@@ -949,6 +986,8 @@ async def voice_clone_by_reference(
                 request.retry_badcase,
                 request.retry_badcase_max_times,
                 request.retry_badcase_ratio_threshold,
+                request.voice_anchor_strength,
+                request.voice_anchor_tail_size,
             )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -1021,6 +1060,8 @@ async def voice_chain(
                 request.retry_badcase,
                 request.retry_badcase_max_times,
                 request.retry_badcase_ratio_threshold,
+                request.voice_anchor_strength,
+                request.voice_anchor_tail_size,
             )
     except ValueError as e:
         raise HTTPException(400, str(e))

@@ -476,6 +476,8 @@ class VoxCPM2Model(nn.Module):
         trim_silence_vad: bool = False,
         streaming: bool = False,
         streaming_prefix_len: int = 4,
+        voice_anchor_strength: float = 0.0,
+        voice_anchor_tail_size: int = 4,
     ) -> Generator[torch.Tensor, None, None]:
         if retry_badcase and streaming:
             warnings.warn("Retry on bad cases is not supported in streaming mode, setting retry_badcase=False.")
@@ -645,6 +647,8 @@ class VoxCPM2Model(nn.Module):
                 cfg_value=cfg_value,
                 streaming=streaming,
                 streaming_prefix_len=streaming_prefix_len,
+                voice_anchor_strength=voice_anchor_strength,
+                voice_anchor_tail_size=voice_anchor_tail_size,
             )
             if streaming:
                 with self.audio_vae.streaming_decode() as vae_dec:
@@ -793,6 +797,8 @@ class VoxCPM2Model(nn.Module):
         retry_badcase_ratio_threshold: float = 6.0,
         streaming: bool = False,
         streaming_prefix_len: int = 4,
+        voice_anchor_strength: float = 0.0,
+        voice_anchor_tail_size: int = 4,
     ) -> Generator[Tuple[torch.Tensor, torch.Tensor, Union[torch.Tensor, List[torch.Tensor]]], None, None]:
         """
         Generate audio using pre-built prompt cache.
@@ -932,6 +938,8 @@ class VoxCPM2Model(nn.Module):
                 cfg_value=cfg_value,
                 streaming=streaming,
                 streaming_prefix_len=streaming_prefix_len,
+                voice_anchor_strength=voice_anchor_strength,
+                voice_anchor_tail_size=voice_anchor_tail_size,
             )
             if streaming:
                 with self.audio_vae.streaming_decode() as vae_dec:
@@ -984,6 +992,8 @@ class VoxCPM2Model(nn.Module):
         cfg_value: float = 2.0,
         streaming: bool = False,
         streaming_prefix_len: int = 4,
+        voice_anchor_strength: float = 0.0,
+        voice_anchor_tail_size: int = 4,
     ) -> Generator[Tuple[torch.Tensor, Union[torch.Tensor, List[torch.Tensor]]], None, None]:
         """Core inference method for audio generation.
 
@@ -1021,6 +1031,22 @@ class VoxCPM2Model(nn.Module):
         combined_embed = text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed
 
         prefix_feat_cond = feat[:, -1, ...]  # b, p, d
+
+        # --- Voice anchor (fork add-on; ref: OpenBMB/VoxCPM#302) -----------------
+        # Below, the DiT condition is overwritten every step with the model's own
+        # prediction (`prefix_feat_cond = pred_feat`), so the reference voice fades
+        # and timbre/emotion drift over long output. When enabled, blend a stable
+        # anchor -- the mean of the last `voice_anchor_tail_size` real prompt/
+        # reference audio frames -- back into the condition each step to keep it
+        # pinned to the reference voice. Disabled by default (strength == 0.0), in
+        # which case behaviour is identical to upstream.
+        voice_anchor = None
+        if voice_anchor_strength > 0.0:
+            audio_pos = feat_mask[0].nonzero(as_tuple=True)[0]
+            if audio_pos.numel() > 0:
+                tail = audio_pos[-min(voice_anchor_tail_size, int(audio_pos.numel())):]
+                voice_anchor = feat[:, tail, ...].mean(dim=1).to(prefix_feat_cond.dtype)
+        # ------------------------------------------------------------------------
         pred_feat_seq = []  # b, t, p, d
         curr_embed = None
 
@@ -1076,7 +1102,13 @@ class VoxCPM2Model(nn.Module):
             curr_embed = self.enc_to_lm_proj(curr_embed)
 
             pred_feat_seq.append(pred_feat.unsqueeze(1))  # b, 1, p, d
-            prefix_feat_cond = pred_feat
+            if voice_anchor is not None:
+                prefix_feat_cond = (
+                    (1.0 - voice_anchor_strength) * pred_feat
+                    + voice_anchor_strength * voice_anchor
+                )
+            else:
+                prefix_feat_cond = pred_feat
 
             if streaming:
                 # Yield only the newest patch latent for stateful VAE decode
