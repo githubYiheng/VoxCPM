@@ -61,11 +61,12 @@ voxcpm --text "你好世界" --output out.wav --model-path models/VoxCPM2
 ## ⚠️ Machine-specific — adjust these per machine
 
 1. **ffmpeg library path (macOS).** torchcodec needs ffmpeg libs on `DYLD_LIBRARY_PATH`.
-   `start.sh` currently hardcodes a versioned Cellar path. The portable form is:
+   `start.sh` sets this automatically via `$(brew --prefix ffmpeg)/lib` (version-independent),
+   so it works on any Mac with `brew install ffmpeg`. For manual commands use the same form:
    ```bash
    DYLD_LIBRARY_PATH="$(brew --prefix ffmpeg)/lib" python app.py --model-id models/VoxCPM2 --port 7860
    ```
-   Requires `brew install ffmpeg`. On **Linux/Windows this is not needed** — drop `DYLD_LIBRARY_PATH`.
+   On **Linux/Windows this is not needed** — drop `DYLD_LIBRARY_PATH`.
 
 2. **Compute device** — auto-detected (CUDA → MPS → CPU), no flag needed.
    - Apple Silicon → MPS, and VoxCPM2 auto-uses **float32** (bf16 drifts on MPS).
