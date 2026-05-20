@@ -72,10 +72,10 @@ GET /info
 **响应**
 ```json
 {
-  "model_id": "openbmb/VoxCPM1.5",
-  "sample_rate": 44100,
+  "model_id": "models/VoxCPM2",
+  "sample_rate": 48000,
   "device": "mps",
-  "dtype": "bfloat16",
+  "dtype": "float32",
   "lora_enabled": false,
   "denoiser_available": true
 }
@@ -124,7 +124,7 @@ Content-Type: application/json
 
 | 响应头 | 说明 |
 |--------|------|
-| `X-Sample-Rate` | 采样率（如 44100） |
+| `X-Sample-Rate` | 采样率（如 48000） |
 | `X-Duration-Seconds` | 音频时长（秒） |
 | `X-Text-Length` | 输入文本长度 |
 | `Content-Type` | audio/wav 或 audio/mpeg 或 audio/flac |
@@ -496,8 +496,8 @@ else:
 |------|--------|------|
 | `API_HOST` | 0.0.0.0 | 服务监听地址 |
 | `API_PORT` | 8000 | 服务端口 |
-| `HF_MODEL_ID` | openbmb/VoxCPM1.5 | HuggingFace 模型 ID |
-| `MODEL_PATH` | - | 本地模型路径（覆盖 HF_MODEL_ID） |
+| `HF_MODEL_ID` | openbmb/VoxCPM2 | HuggingFace 模型 ID |
+| `MODEL_PATH` | models/VoxCPM2 | 本地模型路径（覆盖 HF_MODEL_ID） |
 | `LOAD_DENOISER` | true | 是否加载降噪模型 |
 | `MAX_CONCURRENT_REQUESTS` | 1 | 最大并发请求数 |
 | `REQUEST_TIMEOUT_SECONDS` | 300 | 请求超时时间（秒） |
